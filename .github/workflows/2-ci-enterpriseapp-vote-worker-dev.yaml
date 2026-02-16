@@ -389,23 +389,120 @@ jobs:
   deployment-landscape:
     name: "Stage 11 - Deployment Landscape"
     runs-on: ubuntu-latest
-    needs: verify-deployment
+    needs: [build-image, verify-deployment]
     steps:
-      - name: Print deployment summary
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Gather and display deployment landscape
         run: |
-          echo "============================================================"
-          echo "  DEPLOYMENT LANDSCAPE SUMMARY"
-          echo "============================================================"
-          echo "  App Name      : ${{ env.APP_NAME }}"
-          echo "  Service       : ${{ env.SERVICE_NAME }}"
-          echo "  Environment   : ${{ env.ENV }}"
-          echo "  Image Tag     : ${{ needs.build-image.outputs.image_tag }}"
-          echo "  ECR Repo      : ${{ env.ECR_REPO }}"
-          echo "  Namespace     : ${{ env.NAMESPACE }}"
-          echo "  ArgoCD App    : ${{ env.ARGOCD_APP }}"
-          echo "  Hub Cluster   : ${{ env.HUB_CLUSTER }}"
-          echo "  Spoke Cluster : ${{ env.SPOKE_CLUSTER }}"
-          echo "  Domain        : ${{ env.DOMAIN }}"
-          echo "  Status        : DEPLOYED"
-          echo "  Timestamp     : $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-          echo "============================================================"
+          set -euo pipefail
+
+          aws eks update-kubeconfig --name "${{ env.HUB_CLUSTER }}" --region "${{ env.AWS_REGION }}" --alias hub
+          aws eks update-kubeconfig --name "${{ env.SPOKE_CLUSTER }}" --region "${{ env.AWS_REGION }}" --alias spoke
+
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+          IMAGE_TAG="${{ needs.build-image.outputs.image_tag }}"
+
+          ARGO_HEALTH=$(kubectl get application.argoproj.io "${{ env.ARGOCD_APP }}" -n argocd --context hub -o jsonpath='{.status.health.status}' 2>/dev/null || echo "N/A")
+          ARGO_SYNC=$(kubectl get application.argoproj.io "${{ env.ARGOCD_APP }}" -n argocd --context hub -o jsonpath='{.status.sync.status}' 2>/dev/null || echo "N/A")
+
+          POD_INFO=$(kubectl get pods -n "${{ env.NAMESPACE }}" --context spoke -o wide --no-headers 2>/dev/null || echo "N/A")
+          SVC_INFO=$(kubectl get svc -n "${{ env.NAMESPACE }}" --context spoke --no-headers 2>/dev/null || echo "N/A")
+
+          INGRESS_HOST=$(kubectl get ingress -n "${{ env.NAMESPACE }}" --context spoke -o jsonpath='{.items[0].spec.rules[0].host}' 2>/dev/null || echo "N/A")
+          INGRESS_ADDR=$(kubectl get ingress -n "${{ env.NAMESPACE }}" --context spoke -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+          if [ -z "${INGRESS_ADDR}" ]; then
+            INGRESS_ADDR=$(kubectl get ingress -n "${{ env.NAMESPACE }}" --context spoke -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "N/A")
+          fi
+
+          REDIS_ENDPOINT=$(kubectl get svc redis -n "${{ env.NAMESPACE }}" --context spoke -o jsonpath='{.spec.externalName}' 2>/dev/null || echo "N/A")
+          DB_ENDPOINT=$(kubectl get svc db -n "${{ env.NAMESPACE }}" --context spoke -o jsonpath='{.spec.externalName}' 2>/dev/null || echo "N/A")
+
+          NODE_COUNT=$(kubectl get nodes --context spoke --no-headers 2>/dev/null | wc -l | tr -d ' ')
+
+          VOTE_TAG=$(kubectl get deployment vote -n "${{ env.NAMESPACE }}" --context spoke -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "N/A")
+          RESULT_TAG=$(kubectl get deployment result -n "${{ env.NAMESPACE }}" --context spoke -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "N/A")
+          WORKER_TAG=$(kubectl get deployment worker -n "${{ env.NAMESPACE }}" --context spoke -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "N/A")
+
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════════════════════════╗"
+          echo "║                    OPSERA DEPLOYMENT LANDSCAPE                               ║"
+          echo "║                    enterpriseapp-vote / dev                                   ║"
+          echo "╠══════════════════════════════════════════════════════════════════════════════╣"
+          echo "║                                                                              ║"
+          echo "║  DEPLOYMENT INFO                                                             ║"
+          echo "║  ─────────────────────────────────────────────────────────────────────────    ║"
+          echo "║  App Name        : ${{ env.APP_NAME }}"
+          echo "║  Deployed Service: ${{ env.SERVICE_NAME }}"
+          echo "║  Environment     : ${{ env.ENV }}"
+          echo "║  Tenant          : ${{ env.TENANT }}"
+          echo "║  Timestamp       : $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "║  Trigger         : ${{ github.event_name }} (${{ github.actor }})"
+          echo "║  Commit          : ${{ github.sha }}"
+          echo "║  Image Tag       : ${IMAGE_TAG}"
+          echo "║                                                                              ║"
+          echo "║  ENDPOINTS                                                                   ║"
+          echo "║  ─────────────────────────────────────────────────────────────────────────    ║"
+          echo "║  Ingress Host    : https://${INGRESS_HOST}"
+          echo "║  Vote App        : https://${INGRESS_HOST}/"
+          echo "║  Result App      : https://${INGRESS_HOST}/result"
+          echo "║  Load Balancer   : ${INGRESS_ADDR}"
+          echo "║                                                                              ║"
+          echo "║  INFRASTRUCTURE                                                              ║"
+          echo "║  ─────────────────────────────────────────────────────────────────────────    ║"
+          echo "║  Hub Cluster     : ${{ env.HUB_CLUSTER }} (ArgoCD)"
+          echo "║  Spoke Cluster   : ${{ env.SPOKE_CLUSTER }} (${NODE_COUNT} nodes)"
+          echo "║  Namespace       : ${{ env.NAMESPACE }}"
+          echo "║  AWS Account     : ${AWS_ACCOUNT_ID}"
+          echo "║  AWS Region      : ${{ env.AWS_REGION }}"
+          echo "║                                                                              ║"
+          echo "║  ARGOCD                                                                      ║"
+          echo "║  ─────────────────────────────────────────────────────────────────────────    ║"
+          echo "║  Application     : ${{ env.ARGOCD_APP }}"
+          echo "║  Health          : ${ARGO_HEALTH}"
+          echo "║  Sync            : ${ARGO_SYNC}"
+          echo "║  Repo            : https://github.com/${{ github.repository }}"
+          echo "║  Manifests       : ${{ env.MANIFEST_PATH }}"
+          echo "║                                                                              ║"
+          echo "║  CONTAINER IMAGES (ECR)                                                      ║"
+          echo "║  ─────────────────────────────────────────────────────────────────────────    ║"
+          echo "║  vote            : ${VOTE_TAG}"
+          echo "║  result          : ${RESULT_TAG}"
+          echo "║  worker          : ${WORKER_TAG}"
+          echo "║                                                                              ║"
+          echo "║  AWS MANAGED SERVICES                                                        ║"
+          echo "║  ─────────────────────────────────────────────────────────────────────────    ║"
+          echo "║  ElastiCache     : ${REDIS_ENDPOINT}"
+          echo "║  RDS PostgreSQL  : ${DB_ENDPOINT}"
+          echo "║  DB Credentials  : AWS Secrets Manager (auto-rotated)"
+          echo "║                                                                              ║"
+          echo "║  SERVICES                                                                    ║"
+          echo "║  ─────────────────────────────────────────────────────────────────────────    ║"
+          echo "${SVC_INFO}" | while IFS= read -r line; do echo "║    ${line}"; done
+          echo "║                                                                              ║"
+          echo "║  PODS                                                                        ║"
+          echo "║  ─────────────────────────────────────────────────────────────────────────    ║"
+          echo "${POD_INFO}" | while IFS= read -r line; do echo "║    ${line}"; done
+          echo "║                                                                              ║"
+          echo "║  PIPELINE STAGES                                                             ║"
+          echo "║  ─────────────────────────────────────────────────────────────────────────    ║"
+          echo "║   1. Gitleaks Scan        ✓ (continue-on-error)"
+          echo "║   2. Docker Build         ✓ ${IMAGE_TAG}"
+          echo "║   3. Grype Vuln Scan      ✓ (continue-on-error)"
+          echo "║   4. Push to ECR          ✓ ${ECR_URI}/${{ env.ECR_REPO }}:${IMAGE_TAG}"
+          echo "║   5. ECR Pull Secret      ✓ Refreshed on spoke"
+          echo "║   6. Update Manifests     ✓ kustomization.yaml updated"
+          echo "║   7. ArgoCD App           ✓ Applied to hub"
+          echo "║   8. ArgoCD Refresh       ✓ Hard refresh triggered"
+          echo "║   9. ArgoCD Sync          ✓ ${ARGO_HEALTH} / ${ARGO_SYNC}"
+          echo "║  10. Verify Deployment    ✓ Health check passed"
+          echo "║  11. Landscape            ✓ You are here"
+          echo "║                                                                              ║"
+          echo "╚══════════════════════════════════════════════════════════════════════════════╝"
+          echo ""

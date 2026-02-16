@@ -404,7 +404,7 @@ jobs:
             aws rds create-db-instance \
               --db-instance-identifier "${{ env.DB_IDENTIFIER }}" \
               --engine postgres \
-              --engine-version "15.4" \
+              --engine-version "16.6" \
               --db-instance-class db.t3.micro \
               --allocated-storage 20 \
               --storage-type gp3 \

@@ -1,0 +1,614 @@
+###############################################################################
+# 1b-provision-managed-services-enterpriseapp-vote.yaml
+# Provisions AWS managed services (ElastiCache Redis + RDS PostgreSQL) for the
+# enterpriseapp-vote application. Updates K8s manifests with real endpoints and
+# creates the database secret on the spoke cluster.
+#
+# Trigger: manual (workflow_dispatch) with confirmation gate.
+# Auth:    AWS Access Keys (secrets.AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY)
+###############################################################################
+
+name: "1b - Provision Managed Services (enterpriseapp-vote)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type 'yes' to confirm provisioning"
+        required: true
+        default: "no"
+      db_password:
+        description: "PostgreSQL master password (min 8 chars)"
+        required: true
+
+permissions:
+  contents: write
+  id-token: write
+
+env:
+  APP_NAME: enterpriseapp-vote
+  AWS_REGION: us-west-2
+  SPOKE_CLUSTER: opsera-usw2-np
+  NAMESPACE: opsera-enterpriseapp-vote-dev
+  DB_IDENTIFIER: enterpriseapp-vote-dev
+  REDIS_IDENTIFIER: enterpriseapp-vote-dev
+  DB_USERNAME: postgres
+  DB_NAME: postgres
+
+jobs:
+  # -----------------------------------------------------------------------
+  # Job 1: Discover VPC and Networking from EKS
+  # -----------------------------------------------------------------------
+  discover-networking:
+    name: "Discover VPC & Subnets"
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.confirm == 'yes' }}
+    outputs:
+      vpc_id: ${{ steps.vpc.outputs.vpc_id }}
+      private_subnets: ${{ steps.subnets.outputs.private_subnets }}
+      subnet_csv: ${{ steps.subnets.outputs.subnet_csv }}
+      eks_sg: ${{ steps.sg.outputs.eks_sg }}
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get VPC ID from EKS Cluster
+        id: vpc
+        run: |
+          set -euo pipefail
+          VPC_ID=$(aws eks describe-cluster \
+            --name "${{ env.SPOKE_CLUSTER }}" \
+            --region "${{ env.AWS_REGION }}" \
+            --query "cluster.resourcesVpcConfig.vpcId" \
+            --output text)
+          echo "VPC ID: ${VPC_ID}"
+          echo "vpc_id=${VPC_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Get Private Subnets
+        id: subnets
+        run: |
+          set -euo pipefail
+          VPC_ID="${{ steps.vpc.outputs.vpc_id }}"
+
+          # Get subnets associated with the EKS cluster
+          SUBNET_IDS=$(aws eks describe-cluster \
+            --name "${{ env.SPOKE_CLUSTER }}" \
+            --region "${{ env.AWS_REGION }}" \
+            --query "cluster.resourcesVpcConfig.subnetIds" \
+            --output json)
+          echo "EKS Subnet IDs: ${SUBNET_IDS}"
+
+          # Filter to private subnets (those that route through NAT gateway, not IGW directly)
+          PRIVATE_SUBNETS="[]"
+          for SUBNET_ID in $(echo "${SUBNET_IDS}" | jq -r '.[]'); do
+            # Check route table for this subnet
+            RT_ID=$(aws ec2 describe-route-tables \
+              --filters "Name=association.subnet-id,Values=${SUBNET_ID}" \
+              --region "${{ env.AWS_REGION }}" \
+              --query "RouteTables[0].RouteTableId" \
+              --output text 2>/dev/null || echo "None")
+
+            if [ "${RT_ID}" = "None" ] || [ -z "${RT_ID}" ]; then
+              # Use main route table
+              RT_ID=$(aws ec2 describe-route-tables \
+                --filters "Name=vpc-id,Values=${VPC_ID}" "Name=association.main,Values=true" \
+                --region "${{ env.AWS_REGION }}" \
+                --query "RouteTables[0].RouteTableId" \
+                --output text)
+            fi
+
+            # Check if route table has IGW route (public) or NAT (private)
+            HAS_IGW=$(aws ec2 describe-route-tables \
+              --route-table-ids "${RT_ID}" \
+              --region "${{ env.AWS_REGION }}" \
+              --query "RouteTables[0].Routes[?GatewayId && starts_with(GatewayId, 'igw-')]" \
+              --output text 2>/dev/null || echo "")
+
+            if [ -z "${HAS_IGW}" ] || [ "${HAS_IGW}" = "None" ]; then
+              PRIVATE_SUBNETS=$(echo "${PRIVATE_SUBNETS}" | jq --arg s "${SUBNET_ID}" '. + [$s]')
+              echo "  ${SUBNET_ID} -> private"
+            else
+              echo "  ${SUBNET_ID} -> public (skipping)"
+            fi
+          done
+
+          # If no private subnets found, fall back to all EKS subnets
+          COUNT=$(echo "${PRIVATE_SUBNETS}" | jq 'length')
+          if [ "${COUNT}" -lt 2 ]; then
+            echo "WARNING: Found fewer than 2 private subnets. Falling back to all EKS subnets."
+            PRIVATE_SUBNETS="${SUBNET_IDS}"
+          fi
+
+          # Create CSV for subnet groups
+          SUBNET_CSV=$(echo "${PRIVATE_SUBNETS}" | jq -r 'join(",")')
+          echo "Private subnets: ${SUBNET_CSV}"
+          echo "private_subnets=${PRIVATE_SUBNETS}" >> "$GITHUB_OUTPUT"
+          echo "subnet_csv=${SUBNET_CSV}" >> "$GITHUB_OUTPUT"
+
+      - name: Get EKS Cluster Security Group
+        id: sg
+        run: |
+          set -euo pipefail
+          EKS_SG=$(aws eks describe-cluster \
+            --name "${{ env.SPOKE_CLUSTER }}" \
+            --region "${{ env.AWS_REGION }}" \
+            --query "cluster.resourcesVpcConfig.clusterSecurityGroupId" \
+            --output text)
+          echo "EKS Security Group: ${EKS_SG}"
+          echo "eks_sg=${EKS_SG}" >> "$GITHUB_OUTPUT"
+
+  # -----------------------------------------------------------------------
+  # Job 2: Create Security Groups
+  # -----------------------------------------------------------------------
+  create-security-groups:
+    name: "Create Security Groups"
+    runs-on: ubuntu-latest
+    needs: discover-networking
+    outputs:
+      redis_sg: ${{ steps.redis-sg.outputs.sg_id }}
+      rds_sg: ${{ steps.rds-sg.outputs.sg_id }}
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create Redis Security Group
+        id: redis-sg
+        run: |
+          set -euo pipefail
+          VPC_ID="${{ needs.discover-networking.outputs.vpc_id }}"
+          EKS_SG="${{ needs.discover-networking.outputs.eks_sg }}"
+          SG_NAME="${{ env.APP_NAME }}-redis-sg"
+
+          # Check if SG already exists
+          EXISTING_SG=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=${SG_NAME}" "Name=vpc-id,Values=${VPC_ID}" \
+            --region "${{ env.AWS_REGION }}" \
+            --query "SecurityGroups[0].GroupId" \
+            --output text 2>/dev/null || echo "None")
+
+          if [ "${EXISTING_SG}" != "None" ] && [ -n "${EXISTING_SG}" ]; then
+            echo "Security group ${SG_NAME} already exists: ${EXISTING_SG}"
+            SG_ID="${EXISTING_SG}"
+          else
+            SG_ID=$(aws ec2 create-security-group \
+              --group-name "${SG_NAME}" \
+              --description "Allow Redis access from EKS ${SPOKE_CLUSTER}" \
+              --vpc-id "${VPC_ID}" \
+              --region "${{ env.AWS_REGION }}" \
+              --query "GroupId" \
+              --output text)
+            echo "Created security group: ${SG_ID}"
+
+            # Allow inbound Redis (6379) from EKS cluster SG
+            aws ec2 authorize-security-group-ingress \
+              --group-id "${SG_ID}" \
+              --protocol tcp \
+              --port 6379 \
+              --source-group "${EKS_SG}" \
+              --region "${{ env.AWS_REGION }}"
+            echo "Ingress rule added: TCP 6379 from ${EKS_SG}"
+          fi
+
+          aws ec2 create-tags \
+            --resources "${SG_ID}" \
+            --tags Key=Name,Value="${SG_NAME}" Key=app,Value="${{ env.APP_NAME }}" \
+            --region "${{ env.AWS_REGION }}"
+
+          echo "sg_id=${SG_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Create RDS Security Group
+        id: rds-sg
+        run: |
+          set -euo pipefail
+          VPC_ID="${{ needs.discover-networking.outputs.vpc_id }}"
+          EKS_SG="${{ needs.discover-networking.outputs.eks_sg }}"
+          SG_NAME="${{ env.APP_NAME }}-rds-sg"
+
+          EXISTING_SG=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=${SG_NAME}" "Name=vpc-id,Values=${VPC_ID}" \
+            --region "${{ env.AWS_REGION }}" \
+            --query "SecurityGroups[0].GroupId" \
+            --output text 2>/dev/null || echo "None")
+
+          if [ "${EXISTING_SG}" != "None" ] && [ -n "${EXISTING_SG}" ]; then
+            echo "Security group ${SG_NAME} already exists: ${EXISTING_SG}"
+            SG_ID="${EXISTING_SG}"
+          else
+            SG_ID=$(aws ec2 create-security-group \
+              --group-name "${SG_NAME}" \
+              --description "Allow PostgreSQL access from EKS ${SPOKE_CLUSTER}" \
+              --vpc-id "${VPC_ID}" \
+              --region "${{ env.AWS_REGION }}" \
+              --query "GroupId" \
+              --output text)
+            echo "Created security group: ${SG_ID}"
+
+            # Allow inbound PostgreSQL (5432) from EKS cluster SG
+            aws ec2 authorize-security-group-ingress \
+              --group-id "${SG_ID}" \
+              --protocol tcp \
+              --port 5432 \
+              --source-group "${EKS_SG}" \
+              --region "${{ env.AWS_REGION }}"
+            echo "Ingress rule added: TCP 5432 from ${EKS_SG}"
+          fi
+
+          aws ec2 create-tags \
+            --resources "${SG_ID}" \
+            --tags Key=Name,Value="${SG_NAME}" Key=app,Value="${{ env.APP_NAME }}" \
+            --region "${{ env.AWS_REGION }}"
+
+          echo "sg_id=${SG_ID}" >> "$GITHUB_OUTPUT"
+
+  # -----------------------------------------------------------------------
+  # Job 3: Provision ElastiCache Redis
+  # -----------------------------------------------------------------------
+  provision-redis:
+    name: "Provision ElastiCache Redis"
+    runs-on: ubuntu-latest
+    needs: [discover-networking, create-security-groups]
+    outputs:
+      redis_endpoint: ${{ steps.redis.outputs.endpoint }}
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create ElastiCache Subnet Group
+        run: |
+          set -euo pipefail
+          SUBNET_CSV="${{ needs.discover-networking.outputs.subnet_csv }}"
+          SG_NAME="${{ env.REDIS_IDENTIFIER }}-subnet-group"
+
+          if aws elasticache describe-cache-subnet-groups \
+               --cache-subnet-group-name "${SG_NAME}" \
+               --region "${{ env.AWS_REGION }}" >/dev/null 2>&1; then
+            echo "Subnet group ${SG_NAME} already exists."
+          else
+            IFS=',' read -ra SUBNET_ARRAY <<< "${SUBNET_CSV}"
+            SUBNET_ARGS=""
+            for S in "${SUBNET_ARRAY[@]}"; do
+              SUBNET_ARGS="${SUBNET_ARGS} ${S}"
+            done
+
+            aws elasticache create-cache-subnet-group \
+              --cache-subnet-group-name "${SG_NAME}" \
+              --cache-subnet-group-description "Subnets for ${REDIS_IDENTIFIER}" \
+              --subnet-ids ${SUBNET_ARGS} \
+              --region "${{ env.AWS_REGION }}"
+            echo "Created subnet group: ${SG_NAME}"
+          fi
+
+      - name: Create ElastiCache Redis Cluster
+        run: |
+          set -euo pipefail
+          REDIS_SG="${{ needs.create-security-groups.outputs.redis_sg }}"
+
+          if aws elasticache describe-cache-clusters \
+               --cache-cluster-id "${{ env.REDIS_IDENTIFIER }}" \
+               --region "${{ env.AWS_REGION }}" >/dev/null 2>&1; then
+            echo "ElastiCache cluster ${{ env.REDIS_IDENTIFIER }} already exists."
+          else
+            aws elasticache create-cache-cluster \
+              --cache-cluster-id "${{ env.REDIS_IDENTIFIER }}" \
+              --engine redis \
+              --cache-node-type cache.t3.micro \
+              --num-cache-nodes 1 \
+              --cache-subnet-group-name "${{ env.REDIS_IDENTIFIER }}-subnet-group" \
+              --security-group-ids "${REDIS_SG}" \
+              --engine-version "7.0" \
+              --region "${{ env.AWS_REGION }}" \
+              --tags Key=app,Value="${{ env.APP_NAME }}" Key=environment,Value=dev
+            echo "ElastiCache cluster creation initiated."
+          fi
+
+      - name: Wait for Redis to be Available
+        id: redis
+        run: |
+          set -euo pipefail
+          echo "Waiting for ElastiCache cluster to become available..."
+
+          for i in $(seq 1 60); do
+            STATUS=$(aws elasticache describe-cache-clusters \
+              --cache-cluster-id "${{ env.REDIS_IDENTIFIER }}" \
+              --show-cache-node-info \
+              --region "${{ env.AWS_REGION }}" \
+              --query "CacheClusters[0].CacheClusterStatus" \
+              --output text)
+
+            echo "  Attempt ${i}/60: Status = ${STATUS}"
+
+            if [ "${STATUS}" = "available" ]; then
+              ENDPOINT=$(aws elasticache describe-cache-clusters \
+                --cache-cluster-id "${{ env.REDIS_IDENTIFIER }}" \
+                --show-cache-node-info \
+                --region "${{ env.AWS_REGION }}" \
+                --query "CacheClusters[0].CacheNodes[0].Endpoint.Address" \
+                --output text)
+
+              echo "Redis endpoint: ${ENDPOINT}"
+              echo "endpoint=${ENDPOINT}" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            sleep 15
+          done
+
+          echo "ERROR: ElastiCache cluster did not become available within 15 minutes."
+          exit 1
+
+  # -----------------------------------------------------------------------
+  # Job 4: Provision RDS PostgreSQL
+  # -----------------------------------------------------------------------
+  provision-rds:
+    name: "Provision RDS PostgreSQL"
+    runs-on: ubuntu-latest
+    needs: [discover-networking, create-security-groups]
+    outputs:
+      rds_endpoint: ${{ steps.rds.outputs.endpoint }}
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create RDS Subnet Group
+        run: |
+          set -euo pipefail
+          SUBNET_CSV="${{ needs.discover-networking.outputs.subnet_csv }}"
+          SG_NAME="${{ env.DB_IDENTIFIER }}-subnet-group"
+
+          if aws rds describe-db-subnet-groups \
+               --db-subnet-group-name "${SG_NAME}" \
+               --region "${{ env.AWS_REGION }}" >/dev/null 2>&1; then
+            echo "DB Subnet group ${SG_NAME} already exists."
+          else
+            IFS=',' read -ra SUBNET_ARRAY <<< "${SUBNET_CSV}"
+            SUBNET_ARGS=""
+            for S in "${SUBNET_ARRAY[@]}"; do
+              SUBNET_ARGS="${SUBNET_ARGS} ${S}"
+            done
+
+            aws rds create-db-subnet-group \
+              --db-subnet-group-name "${SG_NAME}" \
+              --db-subnet-group-description "Subnets for ${DB_IDENTIFIER}" \
+              --subnet-ids ${SUBNET_ARGS} \
+              --region "${{ env.AWS_REGION }}"
+            echo "Created DB subnet group: ${SG_NAME}"
+          fi
+
+      - name: Create RDS PostgreSQL Instance
+        run: |
+          set -euo pipefail
+          RDS_SG="${{ needs.create-security-groups.outputs.rds_sg }}"
+
+          if aws rds describe-db-instances \
+               --db-instance-identifier "${{ env.DB_IDENTIFIER }}" \
+               --region "${{ env.AWS_REGION }}" >/dev/null 2>&1; then
+            echo "RDS instance ${{ env.DB_IDENTIFIER }} already exists."
+          else
+            aws rds create-db-instance \
+              --db-instance-identifier "${{ env.DB_IDENTIFIER }}" \
+              --engine postgres \
+              --engine-version "15.4" \
+              --db-instance-class db.t3.micro \
+              --allocated-storage 20 \
+              --storage-type gp3 \
+              --master-username "${{ env.DB_USERNAME }}" \
+              --master-user-password "${{ github.event.inputs.db_password }}" \
+              --db-name "${{ env.DB_NAME }}" \
+              --db-subnet-group-name "${{ env.DB_IDENTIFIER }}-subnet-group" \
+              --vpc-security-group-ids "${RDS_SG}" \
+              --no-publicly-accessible \
+              --backup-retention-period 7 \
+              --storage-encrypted \
+              --deletion-protection \
+              --region "${{ env.AWS_REGION }}" \
+              --tags Key=app,Value="${{ env.APP_NAME }}" Key=environment,Value=dev
+            echo "RDS instance creation initiated."
+          fi
+
+      - name: Wait for RDS to be Available
+        id: rds
+        run: |
+          set -euo pipefail
+          echo "Waiting for RDS instance to become available..."
+
+          for i in $(seq 1 80); do
+            STATUS=$(aws rds describe-db-instances \
+              --db-instance-identifier "${{ env.DB_IDENTIFIER }}" \
+              --region "${{ env.AWS_REGION }}" \
+              --query "DBInstances[0].DBInstanceStatus" \
+              --output text)
+
+            echo "  Attempt ${i}/80: Status = ${STATUS}"
+
+            if [ "${STATUS}" = "available" ]; then
+              ENDPOINT=$(aws rds describe-db-instances \
+                --db-instance-identifier "${{ env.DB_IDENTIFIER }}" \
+                --region "${{ env.AWS_REGION }}" \
+                --query "DBInstances[0].Endpoint.Address" \
+                --output text)
+
+              echo "RDS endpoint: ${ENDPOINT}"
+              echo "endpoint=${ENDPOINT}" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            sleep 15
+          done
+
+          echo "ERROR: RDS instance did not become available within 20 minutes."
+          exit 1
+
+  # -----------------------------------------------------------------------
+  # Job 5: Update K8s Manifests with Real Endpoints
+  # -----------------------------------------------------------------------
+  update-endpoints:
+    name: "Update Manifests with Endpoints"
+    runs-on: ubuntu-latest
+    needs: [provision-redis, provision-rds]
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
+          fetch-depth: 0
+
+      - name: Pull Latest
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull origin "${{ github.ref_name }}" --rebase || true
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Update Kustomization Overlay
+        env:
+          REDIS_ENDPOINT: ${{ needs.provision-redis.outputs.redis_endpoint }}
+          RDS_ENDPOINT: ${{ needs.provision-rds.outputs.rds_endpoint }}
+        run: |
+          set -euo pipefail
+          OVERLAY=".opsera-${{ env.APP_NAME }}/k8s/overlays/dev/kustomization.yaml"
+
+          echo "Redis endpoint: ${REDIS_ENDPOINT}"
+          echo "RDS endpoint:   ${RDS_ENDPOINT}"
+
+          # Update ConfigMap patch - REDIS_HOST
+          yq -i '(.patches[] | select(.target.name == "enterpriseapp-vote-config") | .patch) |=
+            sub("enterpriseapp-vote-dev.xxxxx.usw2.cache.amazonaws.com", strenv(REDIS_ENDPOINT))' \
+            "${OVERLAY}"
+
+          # Update ConfigMap patch - DB_HOST
+          yq -i '(.patches[] | select(.target.name == "enterpriseapp-vote-config") | .patch) |=
+            sub("enterpriseapp-vote-dev.xxxxx.us-west-2.rds.amazonaws.com", strenv(RDS_ENDPOINT))' \
+            "${OVERLAY}"
+
+          # Update Redis ExternalName service
+          yq -i '(.patches[] | select(.target.name == "redis") | .patch) |=
+            sub("enterpriseapp-vote-dev.xxxxx.usw2.cache.amazonaws.com", strenv(REDIS_ENDPOINT))' \
+            "${OVERLAY}"
+
+          # Update DB ExternalName service
+          yq -i '(.patches[] | select(.target.name == "db") | .patch) |=
+            sub("enterpriseapp-vote-dev.xxxxx.us-west-2.rds.amazonaws.com", strenv(RDS_ENDPOINT))' \
+            "${OVERLAY}"
+
+          echo "--- Updated kustomization.yaml ---"
+          cat "${OVERLAY}"
+
+      - name: Commit and Push
+        run: |
+          set -euo pipefail
+          git add ".opsera-${{ env.APP_NAME }}/k8s/overlays/dev/kustomization.yaml"
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "chore: update managed service endpoints for dev [skip ci]"
+            git push origin "${{ github.ref_name }}"
+            echo "Endpoints committed and pushed."
+          fi
+
+  # -----------------------------------------------------------------------
+  # Job 6: Create K8s Database Secret
+  # -----------------------------------------------------------------------
+  create-db-secret:
+    name: "Create K8s Database Secret"
+    runs-on: ubuntu-latest
+    needs: [provision-redis, provision-rds, update-endpoints]
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Configure kubectl for Spoke Cluster
+        run: |
+          set -euo pipefail
+          aws eks update-kubeconfig \
+            --name "${{ env.SPOKE_CLUSTER }}" \
+            --region "${{ env.AWS_REGION }}" \
+            --alias spoke
+
+      - name: Create Database Secret
+        env:
+          RDS_ENDPOINT: ${{ needs.provision-rds.outputs.rds_endpoint }}
+          DB_PASSWORD: ${{ github.event.inputs.db_password }}
+        run: |
+          set -euo pipefail
+
+          # Connection strings for the two services that need them:
+          # result (Node.js): DATABASE_URL = postgres://user:pass@host/dbname
+          # worker (.NET):    DATABASE_CONNECTION_STRING = Server=host;Username=user;Password=pass;Database=dbname;
+
+          DATABASE_URL="postgres://${{ env.DB_USERNAME }}:${DB_PASSWORD}@${RDS_ENDPOINT}:5432/${{ env.DB_NAME }}"
+          DATABASE_CONNECTION_STRING="Server=${RDS_ENDPOINT};Port=5432;Username=${{ env.DB_USERNAME }};Password=${DB_PASSWORD};Database=${{ env.DB_NAME }};"
+
+          kubectl create secret generic enterpriseapp-vote-db-secret \
+            --namespace "${{ env.NAMESPACE }}" \
+            --context spoke \
+            --from-literal=DATABASE_URL="${DATABASE_URL}" \
+            --from-literal=DATABASE_CONNECTION_STRING="${DATABASE_CONNECTION_STRING}" \
+            --dry-run=client -o yaml | kubectl apply --context spoke -f -
+
+          echo "Database secret created/updated in namespace ${{ env.NAMESPACE }}."
+
+  # -----------------------------------------------------------------------
+  # Job 7: Trigger CI/CD Pipelines
+  # -----------------------------------------------------------------------
+  trigger-pipelines:
+    name: "Trigger CI/CD Pipelines"
+    runs-on: ubuntu-latest
+    needs: [create-db-secret]
+
+    steps:
+      - name: Trigger All 3 Service Pipelines
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          set -euo pipefail
+
+          WORKFLOWS=(
+            "2-ci-enterpriseapp-vote-vote-dev.yaml"
+            "2-ci-enterpriseapp-vote-result-dev.yaml"
+            "2-ci-enterpriseapp-vote-worker-dev.yaml"
+          )
+
+          for WF in "${WORKFLOWS[@]}"; do
+            echo "Triggering ${WF} ..."
+            gh workflow run "${WF}" \
+              --ref "${{ github.ref_name }}" \
+              -R "${{ github.repository }}"
+            echo "  Triggered successfully."
+            sleep 2
+          done
+
+          echo ""
+          echo "All 3 CI/CD pipelines triggered. Monitor at:"
+          echo "  https://github.com/${{ github.repository }}/actions"

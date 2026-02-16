@@ -15,8 +15,8 @@ images:
     newName: PLACEHOLDER_ECR_URI_RESULT
     newTag: latest
   - name: PLACEHOLDER_ECR_URI_WORKER
-    newName: PLACEHOLDER_ECR_URI_WORKER
-    newTag: latest
+    newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/enterpriseapp-vote-worker
+    newTag: ""
 patches:
   - target:
       kind: ConfigMap

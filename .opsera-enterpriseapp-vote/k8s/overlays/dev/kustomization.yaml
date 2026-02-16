@@ -16,7 +16,7 @@ images:
     newTag: "11fb728-20260216015112"
   - name: PLACEHOLDER_ECR_URI_WORKER
     newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/enterpriseapp-vote-worker
-    newTag: "d8559a4-20260216005535"
+    newTag: "11fb728-20260216015115"
 patches:
   - target:
       kind: ConfigMap

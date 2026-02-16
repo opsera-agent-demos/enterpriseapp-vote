@@ -27,8 +27,8 @@ patches:
       metadata:
         name: enterpriseapp-vote-config
       data:
-        REDIS_HOST: "enterpriseapp-vote-dev.xxxxx.usw2.cache.amazonaws.com"
-        DB_HOST: "enterpriseapp-vote-dev.xxxxx.us-west-2.rds.amazonaws.com"
+        REDIS_HOST: "enterpriseapp-vote-dev.2muj25.0001.usw2.cache.amazonaws.com"
+        DB_HOST: "enterpriseapp-vote-dev.chwgk42cofpp.us-west-2.rds.amazonaws.com"
   - target:
       kind: Service
       name: redis
@@ -38,7 +38,7 @@ patches:
       metadata:
         name: redis
       spec:
-        externalName: enterpriseapp-vote-dev.xxxxx.usw2.cache.amazonaws.com
+        externalName: enterpriseapp-vote-dev.2muj25.0001.usw2.cache.amazonaws.com
   - target:
       kind: Service
       name: db
@@ -48,4 +48,4 @@ patches:
       metadata:
         name: db
       spec:
-        externalName: enterpriseapp-vote-dev.xxxxx.us-west-2.rds.amazonaws.com
+        externalName: enterpriseapp-vote-dev.chwgk42cofpp.us-west-2.rds.amazonaws.com

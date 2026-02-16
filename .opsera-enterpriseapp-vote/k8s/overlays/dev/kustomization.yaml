@@ -10,7 +10,7 @@ labels:
 images:
   - name: PLACEHOLDER_ECR_URI_VOTE
     newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/enterpriseapp-vote-vote
-    newTag: ""
+    newTag: "d8559a4-20260216005531"
   - name: PLACEHOLDER_ECR_URI_RESULT
     newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/enterpriseapp-vote-result
     newTag: ""

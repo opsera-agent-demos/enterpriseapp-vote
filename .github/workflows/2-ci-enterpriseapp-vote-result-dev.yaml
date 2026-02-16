@@ -308,12 +308,16 @@ jobs:
         run: |
           aws eks update-kubeconfig --name "${{ env.HUB_CLUSTER }}" --region "${{ env.AWS_REGION }}"
 
+          # Debug: verify we can reach the hub cluster and the app exists
+          echo "--- Verifying ArgoCD application access ---"
+          kubectl get application "${{ env.ARGOCD_APP }}" -n argocd -o wide 2>&1 || true
+          echo "---"
+
           echo "Waiting for ArgoCD auto-sync to complete..."
           for i in $(seq 1 60); do
-            HEALTH=$(kubectl get application "${{ env.ARGOCD_APP }}" -n argocd \
-              -o jsonpath='{.status.health.status}' 2>/dev/null || echo "Unknown")
-            SYNC=$(kubectl get application "${{ env.ARGOCD_APP }}" -n argocd \
-              -o jsonpath='{.status.sync.status}' 2>/dev/null || echo "Unknown")
+            APP_JSON=$(kubectl get application.argoproj.io "${{ env.ARGOCD_APP }}" -n argocd -o json 2>/dev/null || echo "{}")
+            HEALTH=$(echo "${APP_JSON}" | jq -r '.status.health.status // "Unknown"')
+            SYNC=$(echo "${APP_JSON}" | jq -r '.status.sync.status // "Unknown"')
 
             echo "Iteration ${i}/60 - Health: ${HEALTH} | Sync: ${SYNC}"
 
@@ -323,7 +327,8 @@ jobs:
             fi
 
             if [ "${HEALTH}" = "Degraded" ] && [ "${i}" -gt 30 ]; then
-              echo "ERROR: Application is Degraded after 30 attempts. Failing."
+              echo "ERROR: Application is Degraded after 30 attempts."
+              echo "${APP_JSON}" | jq '.status.conditions // []'
               exit 1
             fi
 
@@ -331,6 +336,7 @@ jobs:
           done
 
           echo "ERROR: Timed out waiting for sync (5 minutes)"
+          kubectl get application.argoproj.io "${{ env.ARGOCD_APP }}" -n argocd -o yaml 2>&1 | tail -30 || true
           exit 1
 
   # ===========================================================================

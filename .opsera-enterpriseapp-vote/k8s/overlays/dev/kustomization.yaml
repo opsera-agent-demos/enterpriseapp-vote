@@ -13,7 +13,7 @@ images:
     newTag: "11fb728-20260216015108"
   - name: PLACEHOLDER_ECR_URI_RESULT
     newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/enterpriseapp-vote-result
-    newTag: "d8559a4-20260216005533"
+    newTag: "11fb728-20260216015112"
   - name: PLACEHOLDER_ECR_URI_WORKER
     newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/enterpriseapp-vote-worker
     newTag: "d8559a4-20260216005535"

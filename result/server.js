@@ -18,7 +18,8 @@ io.on('connection', function (socket) {
 });
 
 var pool = new Pool({
-  connectionString: process.env.DATABASE_URL || 'postgres://postgres:postgres@db/postgres'
+  connectionString: process.env.DATABASE_URL || 'postgres://postgres:postgres@db/postgres',
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
 });
 
 async.retry(

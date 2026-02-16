@@ -121,8 +121,10 @@ jobs:
           fi
 
           SUBNET_CSV=$(echo "${PRIVATE_SUBNETS}" | jq -r 'join(",")')
+          # Compact JSON to single line for GITHUB_OUTPUT compatibility
+          PRIVATE_SUBNETS_COMPACT=$(echo "${PRIVATE_SUBNETS}" | jq -c '.')
           echo "Private subnets: ${SUBNET_CSV}"
-          echo "private_subnets=${PRIVATE_SUBNETS}" >> "$GITHUB_OUTPUT"
+          echo "private_subnets=${PRIVATE_SUBNETS_COMPACT}" >> "$GITHUB_OUTPUT"
           echo "subnet_csv=${SUBNET_CSV}" >> "$GITHUB_OUTPUT"
 
       - name: Get EKS Cluster Security Group

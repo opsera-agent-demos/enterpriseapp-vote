@@ -6,6 +6,9 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends curl && \
     rm -rf /var/lib/apt/lists/*
 
+# Create non-root user
+RUN adduser --disabled-password --gecos "" --uid 1000 appuser
+
 # Set the application directory
 WORKDIR /usr/local/app
 
@@ -17,6 +20,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 FROM base AS dev
 RUN pip install watchdog
 ENV FLASK_ENV=development
+USER appuser
 CMD ["python", "app.py"]
 
 # final defines the stage that will bundle the application for production
@@ -25,8 +29,18 @@ FROM base AS final
 # Copy our code from the current folder to the working directory inside the container
 COPY . .
 
+# Set ownership to non-root user
+RUN chown -R appuser:appuser /usr/local/app
+
+# Switch to non-root user
+USER appuser
+
 # Make port 80 available for links and/or publish
 EXPOSE 80
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD curl -f http://localhost:80/ || exit 1
 
 # Define our command to be run when launching the container
 CMD ["gunicorn", "app:app", "-b", "0.0.0.0:80", "--log-file", "-", "--access-logfile", "-", "--workers", "4", "--keep-alive", "0"]

@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: opsera-enterpriseapp-vote-dev
+  labels:
+    tenant: opsera
+    app: enterpriseapp-vote
+    managed-by: opsera-c2c

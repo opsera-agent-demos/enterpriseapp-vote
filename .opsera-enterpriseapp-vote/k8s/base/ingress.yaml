@@ -1,0 +1,29 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: enterpriseapp-vote-ingress
+  annotations:
+    kubernetes.io/ingress.class: nginx
+  labels:
+    app: enterpriseapp-vote
+    managed-by: opsera-c2c
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: enterpriseapp-vote-dev.agent.opsera.dev
+      http:
+        paths:
+          - path: /result
+            pathType: Prefix
+            backend:
+              service:
+                name: result
+                port:
+                  number: 80
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: vote
+                port:
+                  number: 80

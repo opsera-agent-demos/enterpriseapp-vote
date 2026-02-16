@@ -1,0 +1,56 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+namespace: opsera-enterpriseapp-vote-dev
+
+labels:
+  - pairs:
+      environment: dev
+    includeSelectors: false
+
+images:
+  - name: PLACEHOLDER_ECR_URI_VOTE
+    newName: PLACEHOLDER_ECR_URI_VOTE
+    newTag: latest
+  - name: PLACEHOLDER_ECR_URI_RESULT
+    newName: PLACEHOLDER_ECR_URI_RESULT
+    newTag: latest
+  - name: PLACEHOLDER_ECR_URI_WORKER
+    newName: PLACEHOLDER_ECR_URI_WORKER
+    newTag: latest
+
+patches:
+  - target:
+      kind: ConfigMap
+      name: enterpriseapp-vote-config
+    patch: |
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: enterpriseapp-vote-config
+      data:
+        REDIS_HOST: "enterpriseapp-vote-dev.xxxxx.usw2.cache.amazonaws.com"
+        DB_HOST: "enterpriseapp-vote-dev.xxxxx.us-west-2.rds.amazonaws.com"
+  - target:
+      kind: Service
+      name: redis
+    patch: |
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: redis
+      spec:
+        externalName: enterpriseapp-vote-dev.xxxxx.usw2.cache.amazonaws.com
+  - target:
+      kind: Service
+      name: db
+    patch: |
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: db
+      spec:
+        externalName: enterpriseapp-vote-dev.xxxxx.us-west-2.rds.amazonaws.com

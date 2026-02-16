@@ -1,0 +1,38 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: opsera-enterpriseapp-vote-dev
+  namespace: argocd
+  labels:
+    app: enterpriseapp-vote
+    tenant: opsera
+    environment: dev
+    managed-by: opsera-c2c
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/opsera-agent-demos/enterpriseapp-vote.git
+    targetRevision: main
+    path: .opsera-enterpriseapp-vote/k8s/overlays/dev
+  destination:
+    name: opsera-usw2-np
+    namespace: opsera-enterpriseapp-vote-dev
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ApplyOutOfSyncOnly=true
+      - RespectIgnoreDifferences=true
+  ignoreDifferences:
+    - group: argoproj.io
+      kind: Rollout
+      jsonPointers:
+        - /spec/template/metadata/annotations
+    - group: argoproj.io
+      kind: AnalysisTemplate
+      jsonPointers:
+        - /spec/metrics

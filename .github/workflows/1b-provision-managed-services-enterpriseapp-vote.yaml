@@ -579,11 +579,14 @@ jobs:
           DB_PASSWORD=$(echo "${SECRET_JSON}" | jq -r '.password')
           DB_USER=$(echo "${SECRET_JSON}" | jq -r '.username')
 
+          # URL-encode password for postgres:// URI (special chars like $, >, [ break URL parsing)
+          ENCODED_PASSWORD=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "${DB_PASSWORD}")
+
           # Build connection strings:
-          # result (Node.js): DATABASE_URL = postgres://user:pass@host:5432/dbname
-          # worker (.NET):    DATABASE_CONNECTION_STRING = Server=host;Port=5432;...
-          DATABASE_URL="postgres://${DB_USER}:${DB_PASSWORD}@${RDS_ENDPOINT}:5432/${{ env.DB_NAME }}"
-          DATABASE_CONNECTION_STRING="Server=${RDS_ENDPOINT};Port=5432;Username=${DB_USER};Password=${DB_PASSWORD};Database=${{ env.DB_NAME }};"
+          # result (Node.js): DATABASE_URL = postgres://user:pass@host:5432/dbname (URL-encoded password, no sslmode - app handles SSL)
+          # worker (.NET):    DATABASE_CONNECTION_STRING = Server=host;Port=5432;... (SSL Mode=Require for RDS)
+          DATABASE_URL="postgres://${DB_USER}:${ENCODED_PASSWORD}@${RDS_ENDPOINT}:5432/${{ env.DB_NAME }}"
+          DATABASE_CONNECTION_STRING="Server=${RDS_ENDPOINT};Port=5432;Username=${DB_USER};Password=${DB_PASSWORD};Database=${{ env.DB_NAME }};SSL Mode=Require;Trust Server Certificate=true;"
 
           # Mask secrets in logs
           echo "::add-mask::${DB_PASSWORD}"

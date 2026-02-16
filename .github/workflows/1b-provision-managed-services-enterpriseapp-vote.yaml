@@ -562,8 +562,7 @@ jobs:
             --region "${{ env.AWS_REGION }}" \
             --alias spoke
 
-      - name: Retrieve RDS Password from Secrets Manager
-        id: db-creds
+      - name: Retrieve Credentials and Create K8s Secret
         env:
           SECRET_ARN: ${{ needs.provision-rds.outputs.secret_arn }}
           RDS_ENDPOINT: ${{ needs.provision-rds.outputs.rds_endpoint }}
@@ -580,32 +579,31 @@ jobs:
           DB_PASSWORD=$(echo "${SECRET_JSON}" | jq -r '.password')
           DB_USER=$(echo "${SECRET_JSON}" | jq -r '.username')
 
-          # Build connection strings for the two services:
+          # Build connection strings:
           # result (Node.js): DATABASE_URL = postgres://user:pass@host:5432/dbname
-          # worker (.NET):    DATABASE_CONNECTION_STRING = Server=host;Port=5432;Username=user;Password=pass;Database=dbname;
-
+          # worker (.NET):    DATABASE_CONNECTION_STRING = Server=host;Port=5432;...
           DATABASE_URL="postgres://${DB_USER}:${DB_PASSWORD}@${RDS_ENDPOINT}:5432/${{ env.DB_NAME }}"
           DATABASE_CONNECTION_STRING="Server=${RDS_ENDPOINT};Port=5432;Username=${DB_USER};Password=${DB_PASSWORD};Database=${{ env.DB_NAME }};"
 
           # Mask secrets in logs
           echo "::add-mask::${DB_PASSWORD}"
-          echo "::add-mask::${DATABASE_URL}"
-          echo "::add-mask::${DATABASE_CONNECTION_STRING}"
 
-          echo "database_url=${DATABASE_URL}" >> "$GITHUB_OUTPUT"
-          echo "connection_string=${DATABASE_CONNECTION_STRING}" >> "$GITHUB_OUTPUT"
-          echo "RDS credentials retrieved from Secrets Manager successfully."
+          # Write secret YAML to a temp file (avoids pipe masking issue)
+          SECRET_FILE=$(mktemp)
+          cat > "${SECRET_FILE}" <<SECRETEOF
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: enterpriseapp-vote-db-secret
+            namespace: ${{ env.NAMESPACE }}
+          type: Opaque
+          stringData:
+            DATABASE_URL: "${DATABASE_URL}"
+            DATABASE_CONNECTION_STRING: "${DATABASE_CONNECTION_STRING}"
+          SECRETEOF
 
-      - name: Create K8s Database Secret
-        run: |
-          set -euo pipefail
-
-          kubectl create secret generic enterpriseapp-vote-db-secret \
-            --namespace "${{ env.NAMESPACE }}" \
-            --context spoke \
-            --from-literal=DATABASE_URL="${{ steps.db-creds.outputs.database_url }}" \
-            --from-literal=DATABASE_CONNECTION_STRING="${{ steps.db-creds.outputs.connection_string }}" \
-            --dry-run=client -o yaml | kubectl apply --context spoke -f -
+          kubectl apply --context spoke -f "${SECRET_FILE}"
+          rm -f "${SECRET_FILE}"
 
           echo "Database secret created/updated in namespace ${{ env.NAMESPACE }}."
           echo "Credentials sourced from Secrets Manager (auto-rotated by AWS)."

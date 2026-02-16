@@ -206,7 +206,7 @@ jobs:
   update-manifests:
     name: "Stage 6 - Update K8s Manifests"
     runs-on: ubuntu-latest
-    needs: [push-to-ecr, refresh-ecr-secret]
+    needs: [build-image, push-to-ecr, refresh-ecr-secret]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

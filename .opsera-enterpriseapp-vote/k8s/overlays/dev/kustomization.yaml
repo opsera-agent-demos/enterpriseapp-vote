@@ -12,8 +12,8 @@ images:
     newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/enterpriseapp-vote-vote
     newTag: ""
   - name: PLACEHOLDER_ECR_URI_RESULT
-    newName: PLACEHOLDER_ECR_URI_RESULT
-    newTag: latest
+    newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/enterpriseapp-vote-result
+    newTag: ""
   - name: PLACEHOLDER_ECR_URI_WORKER
     newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/enterpriseapp-vote-worker
     newTag: ""

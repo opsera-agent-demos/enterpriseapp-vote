@@ -24,8 +24,8 @@ RUN dotnet publish -c release -o /app -a $TARGETARCH --self-contained false --no
 # app image
 FROM mcr.microsoft.com/dotnet/runtime:7.0
 
-# Create non-root user
-RUN groupadd -r appuser && useradd -r -g appuser -u 1000 appuser
+# Create non-root user (use UID 10001 to avoid conflict with base image)
+RUN groupadd -r appuser && useradd -r -g appuser -u 10001 appuser
 
 WORKDIR /app
 COPY --from=build /app .

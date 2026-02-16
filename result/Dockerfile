@@ -5,8 +5,8 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends curl tini && \
     rm -rf /var/lib/apt/lists/*
 
-# Create non-root user
-RUN groupadd -r appuser && useradd -r -g appuser -u 1000 appuser
+# Create non-root user (use UID 10001 to avoid conflict with node user at 1000)
+RUN groupadd -r appuser && useradd -r -g appuser -u 10001 appuser
 
 WORKDIR /usr/local/app
 

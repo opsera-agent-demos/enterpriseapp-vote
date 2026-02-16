@@ -150,8 +150,20 @@ jobs:
       - name: Create ArgoCD Manager SA on Spoke
         run: |
           set -euo pipefail
+          # Create service account (idempotent)
           kubectl create serviceaccount argocd-manager --namespace kube-system --context spoke --dry-run=client -o yaml | kubectl apply --context spoke -f -
-          kubectl create clusterrolebinding argocd-manager-role-binding --clusterrole=cluster-admin --serviceaccount=kube-system:argocd-manager --context spoke --dry-run=client -o yaml | kubectl apply --context spoke -f -
+
+          # ClusterRoleBinding roleRef is immutable - check if it exists first
+          if kubectl get clusterrolebinding argocd-manager-role-binding --context spoke >/dev/null 2>&1; then
+            echo "ClusterRoleBinding argocd-manager-role-binding already exists. Skipping."
+          else
+            kubectl create clusterrolebinding argocd-manager-role-binding \
+              --clusterrole=cluster-admin \
+              --serviceaccount=kube-system:argocd-manager \
+              --context spoke
+          fi
+
+          # Create token secret (idempotent)
           kubectl apply --context spoke -f - <<EOF
           apiVersion: v1
           kind: Secret

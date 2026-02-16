@@ -1,8 +1,11 @@
 ###############################################################################
 # 1b-provision-managed-services-enterpriseapp-vote.yaml
 # Provisions AWS managed services (ElastiCache Redis + RDS PostgreSQL) for the
-# enterpriseapp-vote application. Updates K8s manifests with real endpoints and
-# creates the database secret on the spoke cluster.
+# enterpriseapp-vote application. Uses Secrets Manager for RDS credentials
+# (--manage-master-user-password). No passwords in workflow inputs.
+#
+# Updates K8s manifests with real endpoints and creates the database secret
+# on the spoke cluster by reading credentials from Secrets Manager.
 #
 # Trigger: manual (workflow_dispatch) with confirmation gate.
 # Auth:    AWS Access Keys (secrets.AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY)
@@ -17,9 +20,6 @@ on:
         description: "Type 'yes' to confirm provisioning"
         required: true
         default: "no"
-      db_password:
-        description: "PostgreSQL master password (min 8 chars)"
-        required: true
 
 permissions:
   contents: write
@@ -83,10 +83,9 @@ jobs:
             --output json)
           echo "EKS Subnet IDs: ${SUBNET_IDS}"
 
-          # Filter to private subnets (those that route through NAT gateway, not IGW directly)
+          # Filter to private subnets (those that route through NAT gateway, not IGW)
           PRIVATE_SUBNETS="[]"
           for SUBNET_ID in $(echo "${SUBNET_IDS}" | jq -r '.[]'); do
-            # Check route table for this subnet
             RT_ID=$(aws ec2 describe-route-tables \
               --filters "Name=association.subnet-id,Values=${SUBNET_ID}" \
               --region "${{ env.AWS_REGION }}" \
@@ -94,7 +93,6 @@ jobs:
               --output text 2>/dev/null || echo "None")
 
             if [ "${RT_ID}" = "None" ] || [ -z "${RT_ID}" ]; then
-              # Use main route table
               RT_ID=$(aws ec2 describe-route-tables \
                 --filters "Name=vpc-id,Values=${VPC_ID}" "Name=association.main,Values=true" \
                 --region "${{ env.AWS_REGION }}" \
@@ -102,7 +100,6 @@ jobs:
                 --output text)
             fi
 
-            # Check if route table has IGW route (public) or NAT (private)
             HAS_IGW=$(aws ec2 describe-route-tables \
               --route-table-ids "${RT_ID}" \
               --region "${{ env.AWS_REGION }}" \
@@ -117,14 +114,12 @@ jobs:
             fi
           done
 
-          # If no private subnets found, fall back to all EKS subnets
           COUNT=$(echo "${PRIVATE_SUBNETS}" | jq 'length')
           if [ "${COUNT}" -lt 2 ]; then
             echo "WARNING: Found fewer than 2 private subnets. Falling back to all EKS subnets."
             PRIVATE_SUBNETS="${SUBNET_IDS}"
           fi
 
-          # Create CSV for subnet groups
           SUBNET_CSV=$(echo "${PRIVATE_SUBNETS}" | jq -r 'join(",")')
           echo "Private subnets: ${SUBNET_CSV}"
           echo "private_subnets=${PRIVATE_SUBNETS}" >> "$GITHUB_OUTPUT"
@@ -169,7 +164,6 @@ jobs:
           EKS_SG="${{ needs.discover-networking.outputs.eks_sg }}"
           SG_NAME="${{ env.APP_NAME }}-redis-sg"
 
-          # Check if SG already exists
           EXISTING_SG=$(aws ec2 describe-security-groups \
             --filters "Name=group-name,Values=${SG_NAME}" "Name=vpc-id,Values=${VPC_ID}" \
             --region "${{ env.AWS_REGION }}" \
@@ -189,7 +183,6 @@ jobs:
               --output text)
             echo "Created security group: ${SG_ID}"
 
-            # Allow inbound Redis (6379) from EKS cluster SG
             aws ec2 authorize-security-group-ingress \
               --group-id "${SG_ID}" \
               --protocol tcp \
@@ -233,7 +226,6 @@ jobs:
               --output text)
             echo "Created security group: ${SG_ID}"
 
-            # Allow inbound PostgreSQL (5432) from EKS cluster SG
             aws ec2 authorize-security-group-ingress \
               --group-id "${SG_ID}" \
               --protocol tcp \
@@ -251,7 +243,7 @@ jobs:
           echo "sg_id=${SG_ID}" >> "$GITHUB_OUTPUT"
 
   # -----------------------------------------------------------------------
-  # Job 3: Provision ElastiCache Redis
+  # Job 3: Provision ElastiCache Redis (no auth - VPC + SG isolation for dev)
   # -----------------------------------------------------------------------
   provision-redis:
     name: "Provision ElastiCache Redis"
@@ -352,7 +344,7 @@ jobs:
           exit 1
 
   # -----------------------------------------------------------------------
-  # Job 4: Provision RDS PostgreSQL
+  # Job 4: Provision RDS PostgreSQL (Secrets Manager managed password)
   # -----------------------------------------------------------------------
   provision-rds:
     name: "Provision RDS PostgreSQL"
@@ -360,6 +352,7 @@ jobs:
     needs: [discover-networking, create-security-groups]
     outputs:
       rds_endpoint: ${{ steps.rds.outputs.endpoint }}
+      secret_arn: ${{ steps.rds.outputs.secret_arn }}
 
     steps:
       - name: Configure AWS Credentials
@@ -394,7 +387,7 @@ jobs:
             echo "Created DB subnet group: ${SG_NAME}"
           fi
 
-      - name: Create RDS PostgreSQL Instance
+      - name: Create RDS PostgreSQL Instance (Secrets Manager managed password)
         run: |
           set -euo pipefail
           RDS_SG="${{ needs.create-security-groups.outputs.rds_sg }}"
@@ -404,6 +397,8 @@ jobs:
                --region "${{ env.AWS_REGION }}" >/dev/null 2>&1; then
             echo "RDS instance ${{ env.DB_IDENTIFIER }} already exists."
           else
+            # --manage-master-user-password: AWS auto-generates the password
+            # and stores it in Secrets Manager. No password input required.
             aws rds create-db-instance \
               --db-instance-identifier "${{ env.DB_IDENTIFIER }}" \
               --engine postgres \
@@ -412,7 +407,7 @@ jobs:
               --allocated-storage 20 \
               --storage-type gp3 \
               --master-username "${{ env.DB_USERNAME }}" \
-              --master-user-password "${{ github.event.inputs.db_password }}" \
+              --manage-master-user-password \
               --db-name "${{ env.DB_NAME }}" \
               --db-subnet-group-name "${{ env.DB_IDENTIFIER }}-subnet-group" \
               --vpc-security-group-ids "${RDS_SG}" \
@@ -422,7 +417,7 @@ jobs:
               --deletion-protection \
               --region "${{ env.AWS_REGION }}" \
               --tags Key=app,Value="${{ env.APP_NAME }}" Key=environment,Value=dev
-            echo "RDS instance creation initiated."
+            echo "RDS instance creation initiated (password managed by Secrets Manager)."
           fi
 
       - name: Wait for RDS to be Available
@@ -447,8 +442,17 @@ jobs:
                 --query "DBInstances[0].Endpoint.Address" \
                 --output text)
 
+              # Get the Secrets Manager ARN for the managed password
+              SECRET_ARN=$(aws rds describe-db-instances \
+                --db-instance-identifier "${{ env.DB_IDENTIFIER }}" \
+                --region "${{ env.AWS_REGION }}" \
+                --query "DBInstances[0].MasterUserSecret.SecretArn" \
+                --output text)
+
               echo "RDS endpoint: ${ENDPOINT}"
+              echo "Secrets Manager ARN: ${SECRET_ARN}"
               echo "endpoint=${ENDPOINT}" >> "$GITHUB_OUTPUT"
+              echo "secret_arn=${SECRET_ARN}" >> "$GITHUB_OUTPUT"
               exit 0
             fi
 
@@ -533,12 +537,12 @@ jobs:
           fi
 
   # -----------------------------------------------------------------------
-  # Job 6: Create K8s Database Secret
+  # Job 6: Create K8s Database Secret (from Secrets Manager - no passwords)
   # -----------------------------------------------------------------------
   create-db-secret:
     name: "Create K8s Database Secret"
     runs-on: ubuntu-latest
-    needs: [provision-redis, provision-rds, update-endpoints]
+    needs: [provision-rds, update-endpoints]
 
     steps:
       - name: Configure AWS Credentials
@@ -556,28 +560,53 @@ jobs:
             --region "${{ env.AWS_REGION }}" \
             --alias spoke
 
-      - name: Create Database Secret
+      - name: Retrieve RDS Password from Secrets Manager
+        id: db-creds
         env:
+          SECRET_ARN: ${{ needs.provision-rds.outputs.secret_arn }}
           RDS_ENDPOINT: ${{ needs.provision-rds.outputs.rds_endpoint }}
-          DB_PASSWORD: ${{ github.event.inputs.db_password }}
         run: |
           set -euo pipefail
 
-          # Connection strings for the two services that need them:
-          # result (Node.js): DATABASE_URL = postgres://user:pass@host/dbname
-          # worker (.NET):    DATABASE_CONNECTION_STRING = Server=host;Username=user;Password=pass;Database=dbname;
+          echo "Retrieving RDS credentials from Secrets Manager..."
+          SECRET_JSON=$(aws secretsmanager get-secret-value \
+            --secret-id "${SECRET_ARN}" \
+            --region "${{ env.AWS_REGION }}" \
+            --query "SecretString" \
+            --output text)
 
-          DATABASE_URL="postgres://${{ env.DB_USERNAME }}:${DB_PASSWORD}@${RDS_ENDPOINT}:5432/${{ env.DB_NAME }}"
-          DATABASE_CONNECTION_STRING="Server=${RDS_ENDPOINT};Port=5432;Username=${{ env.DB_USERNAME }};Password=${DB_PASSWORD};Database=${{ env.DB_NAME }};"
+          DB_PASSWORD=$(echo "${SECRET_JSON}" | jq -r '.password')
+          DB_USER=$(echo "${SECRET_JSON}" | jq -r '.username')
+
+          # Build connection strings for the two services:
+          # result (Node.js): DATABASE_URL = postgres://user:pass@host:5432/dbname
+          # worker (.NET):    DATABASE_CONNECTION_STRING = Server=host;Port=5432;Username=user;Password=pass;Database=dbname;
+
+          DATABASE_URL="postgres://${DB_USER}:${DB_PASSWORD}@${RDS_ENDPOINT}:5432/${{ env.DB_NAME }}"
+          DATABASE_CONNECTION_STRING="Server=${RDS_ENDPOINT};Port=5432;Username=${DB_USER};Password=${DB_PASSWORD};Database=${{ env.DB_NAME }};"
+
+          # Mask secrets in logs
+          echo "::add-mask::${DB_PASSWORD}"
+          echo "::add-mask::${DATABASE_URL}"
+          echo "::add-mask::${DATABASE_CONNECTION_STRING}"
+
+          echo "database_url=${DATABASE_URL}" >> "$GITHUB_OUTPUT"
+          echo "connection_string=${DATABASE_CONNECTION_STRING}" >> "$GITHUB_OUTPUT"
+          echo "RDS credentials retrieved from Secrets Manager successfully."
+
+      - name: Create K8s Database Secret
+        run: |
+          set -euo pipefail
 
           kubectl create secret generic enterpriseapp-vote-db-secret \
             --namespace "${{ env.NAMESPACE }}" \
             --context spoke \
-            --from-literal=DATABASE_URL="${DATABASE_URL}" \
-            --from-literal=DATABASE_CONNECTION_STRING="${DATABASE_CONNECTION_STRING}" \
+            --from-literal=DATABASE_URL="${{ steps.db-creds.outputs.database_url }}" \
+            --from-literal=DATABASE_CONNECTION_STRING="${{ steps.db-creds.outputs.connection_string }}" \
             --dry-run=client -o yaml | kubectl apply --context spoke -f -
 
           echo "Database secret created/updated in namespace ${{ env.NAMESPACE }}."
+          echo "Credentials sourced from Secrets Manager (auto-rotated by AWS)."
 
   # -----------------------------------------------------------------------
   # Job 7: Trigger CI/CD Pipelines
@@ -610,5 +639,15 @@ jobs:
           done
 
           echo ""
-          echo "All 3 CI/CD pipelines triggered. Monitor at:"
-          echo "  https://github.com/${{ github.repository }}/actions"
+          echo "=========================================="
+          echo "  All 3 CI/CD pipelines triggered!"
+          echo "=========================================="
+          echo ""
+          echo "Summary:"
+          echo "  - ElastiCache Redis: ${{ needs.create-db-secret.result == 'success' && 'Provisioned' || 'Check logs' }}"
+          echo "  - RDS PostgreSQL:    Provisioned (password in Secrets Manager)"
+          echo "  - K8s manifests:     Updated with real endpoints"
+          echo "  - K8s db secret:     Created from Secrets Manager"
+          echo "  - CI/CD pipelines:   Triggered for vote, result, worker"
+          echo ""
+          echo "Monitor at: https://github.com/${{ github.repository }}/actions"
